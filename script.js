@@ -16,6 +16,11 @@ class MusicPlayer {
     this.selectedTracks = new Set()
     this.isBackground = false
     this.wakeLock = null
+    this.audioWakeLock = null
+    this.mediaSessionSupported = "mediaSession" in navigator
+    this.isBackground = false
+    this.lastPlaybackPosition = 0
+    this.positionUpdateInterval = null
     this.backgroundNotification = null
     this.miniPlayer = null
     this.backgroundIndicator = null
@@ -372,6 +377,18 @@ class MusicPlayer {
       const items = Array.from(e.dataTransfer.items)
       this.handleDroppedItems(items)
     })
+
+    // Обработка изменения видимости страницы для мобильных устройств
+    document.addEventListener("visibilitychange", () => this.handleVisibilityChange())
+
+    // Обработка событий жизненного цикла страницы
+    window.addEventListener("beforeunload", () => this.handlePageUnload())
+    window.addEventListener("pagehide", () => this.handlePageHide())
+    window.addEventListener("pageshow", () => this.handlePageShow())
+
+    // Обработка потери фокуса аудио (для iOS)
+    this.audio.addEventListener("suspend", () => this.handleAudioSuspend())
+    this.audio.addEventListener("canplaythrough", () => this.handleAudioReady())
   }
 
   // Визуализатор
@@ -547,17 +564,31 @@ class MusicPlayer {
       await this.audio.play()
       this.isPlaying = true
       this.playBtn.innerHTML = '<i class="fas fa-pause"></i>'
-      this.updateCurrentTrackInfo()
 
-      // Обновляем мини-плеер и Media Session
+      // Запрашиваем Wake Lock при начале воспроизведения
+      await this.requestAudioWakeLock()
+
+      // Обновляем Media Session
+      this.updateMediaSessionFull()
+
+      // Обновляем интерфейс
+      this.updateCurrentTrackInfo()
+      this.updateTrackList()
+
+      // Запускаем обновления позиции
+      this.startPositionUpdates()
+
+      // Если в фоновом режиме, обновляем мини-плеер
       if (this.isBackground) {
         this.updateMiniPlayer()
-        this.updateMediaSession()
         this.showTrackNotification(currentTrack)
       }
-      this.updateTrackList()
     } catch (error) {
       console.error("Ошибка воспроизведения:", error)
+      // На мобильных устройствах может потребоваться взаимодействие пользователя
+      if (error.name === "NotAllowedError") {
+        alert("Для воспроизведения музыки требуется взаимодействие с экраном")
+      }
     }
   }
 
@@ -566,7 +597,18 @@ class MusicPlayer {
     this.isPlaying = false
     this.playBtn.innerHTML = '<i class="fas fa-play"></i>'
 
-    // Обновляем мини-плеер
+    // Останавливаем обновления позиции
+    this.stopPositionUpdates()
+
+    // Освобождаем Wake Lock при паузе
+    this.releaseAudioWakeLock()
+
+    // Обновляем Media Session
+    if (this.mediaSessionSupported) {
+      navigator.mediaSession.playbackState = "paused"
+    }
+
+    // Обновляем мини-плеер если в фоновом режиме
     if (this.isBackground) {
       this.updateMiniPlayer()
     }
@@ -1166,173 +1208,330 @@ class MusicPlayer {
 
   // Вход в фоновый режим
   async enterBackgroundMode() {
+    console.log("Входим в фоновый режим")
     this.isBackground = true
 
-    // Показываем уведомление
-    this.showBackgroundNotification()
+    // Запрашиваем Wake Lock для аудио
+    await this.requestAudioWakeLock()
 
-    // Создаем мини-плеер
-    this.createMiniPlayer()
+    // Обновляем Media Session с полной информацией
+    this.updateMediaSessionFull()
 
-    // Обновляем Media Session
-    this.updateMediaSession()
+    // Запускаем периодическое обновление позиции
+    this.startPositionUpdates()
 
-    // Запрашиваем Wake Lock для предотвращения засыпания
-    try {
-      if ("wakeLock" in navigator) {
-        this.wakeLock = await navigator.wakeLock.request("screen")
-      }
-    } catch (error) {
-      console.log("Wake Lock не поддерживается:", error)
+    // Показываем уведомление (только если воспроизводится музыка)
+    if (this.isPlaying) {
+      this.showBackgroundNotification()
+      this.createMiniPlayer()
     }
 
-    // Отправляем сообщение Service Worker
-    this.sendMessageToServiceWorker({
-      type: "PLAYBACK_STATE_CHANGED",
-      data: {
-        isPlaying: this.isPlaying,
-        position: this.audio.currentTime,
-        duration: this.audio.duration,
-      },
-    })
+    // Регистрируем фоновую синхронизацию
+    this.registerBackgroundSync()
   }
 
-  // Выход из фонового режима
   exitBackgroundMode() {
+    console.log("Выходим из фонового режима")
     this.isBackground = false
 
-    // Скрываем уведомление и мини-плеер
-    this.hideBackgroundNotification()
-    this.removeMiniPlayer()
+    // Останавливаем обновления позиции
+    this.stopPositionUpdates()
 
     // Освобождаем Wake Lock
+    this.releaseAudioWakeLock()
+
+    // Скрываем элементы фонового режима
+    this.hideBackgroundNotification()
+    this.removeMiniPlayer()
+  }
+
+  // Запрос Wake Lock для предотвращения засыпания во время воспроизведения
+  async requestAudioWakeLock() {
+    try {
+      if ("wakeLock" in navigator) {
+        // Запрашиваем screen wake lock для предотвращения затемнения экрана
+        if (!this.wakeLock) {
+          this.wakeLock = await navigator.wakeLock.request("screen")
+          console.log("Screen Wake Lock активирован")
+        }
+      }
+    } catch (error) {
+      console.log("Wake Lock не поддерживается или недоступен:", error)
+    }
+  }
+
+  releaseAudioWakeLock() {
     if (this.wakeLock) {
       this.wakeLock.release()
       this.wakeLock = null
+      console.log("Wake Lock освобожден")
     }
   }
 
-  // Показ уведомления о фоновом режиме
-  showBackgroundNotification() {
-    if (this.backgroundNotification) {
-      this.backgroundNotification.classList.add("show")
+  // Улучшенное обновление Media Session с полной поддержкой
+  updateMediaSessionFull() {
+    if (!this.mediaSessionSupported) return
 
-      // Автоматически скрываем через 5 секунд
+    const tracks = this.getCurrentTrackList()
+    const currentTrack = tracks[this.currentTrackIndex]
+
+    if (!currentTrack) return
+
+    try {
+      // Обновляем метаданные
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: currentTrack.title,
+        artist: currentTrack.artist,
+        album: this.currentPlaylist ? this.currentPlaylist.name : "Мой плейлист",
+        artwork: currentTrack.cover
+          ? [
+              { src: currentTrack.cover, sizes: "96x96", type: "image/jpeg" },
+              { src: currentTrack.cover, sizes: "128x128", type: "image/jpeg" },
+              { src: currentTrack.cover, sizes: "192x192", type: "image/jpeg" },
+              { src: currentTrack.cover, sizes: "256x256", type: "image/jpeg" },
+              { src: currentTrack.cover, sizes: "384x384", type: "image/jpeg" },
+              { src: currentTrack.cover, sizes: "512x512", type: "image/jpeg" },
+            ]
+          : [],
+      })
+
+      // Устанавливаем состояние воспроизведения
+      navigator.mediaSession.playbackState = this.isPlaying ? "playing" : "paused"
+
+      // Устанавливаем позицию
+      if (this.audio.duration && !isNaN(this.audio.duration)) {
+        navigator.mediaSession.setPositionState({
+          duration: this.audio.duration,
+          playbackRate: this.audio.playbackRate || 1.0,
+          position: this.audio.currentTime || 0,
+        })
+      }
+
+      // Устанавливаем обработчики действий
+      this.setupMediaSessionHandlers()
+
+      // Отправляем данные в Service Worker
+      this.sendMessageToServiceWorker({
+        type: "TRACK_CHANGED",
+        data: {
+          title: currentTrack.title,
+          artist: currentTrack.artist,
+          album: this.currentPlaylist ? this.currentPlaylist.name : "Мой плейлист",
+          artwork: currentTrack.cover,
+        },
+      })
+    } catch (error) {
+      console.error("Ошибка обновления Media Session:", error)
+    }
+  }
+
+  // Настройка обработчиков Media Session
+  setupMediaSessionHandlers() {
+    if (!this.mediaSessionSupported) return
+
+    const handlers = {
+      play: () => {
+        console.log("Media Session: Play")
+        if (!this.isPlaying) this.play()
+      },
+      pause: () => {
+        console.log("Media Session: Pause")
+        if (this.isPlaying) this.pause()
+      },
+      stop: () => {
+        console.log("Media Session: Stop")
+        this.pause()
+        this.audio.currentTime = 0
+      },
+      previoustrack: () => {
+        console.log("Media Session: Previous")
+        this.previousTrack()
+      },
+      nexttrack: () => {
+        console.log("Media Session: Next")
+        this.nextTrack()
+      },
+      seekbackward: (details) => {
+        console.log("Media Session: Seek backward")
+        const skipTime = details.seekOffset || 10
+        this.audio.currentTime = Math.max(0, this.audio.currentTime - skipTime)
+      },
+      seekforward: (details) => {
+        console.log("Media Session: Seek forward")
+        const skipTime = details.seekOffset || 10
+        this.audio.currentTime = Math.min(this.audio.duration, this.audio.currentTime + skipTime)
+      },
+      seekto: (details) => {
+        console.log("Media Session: Seek to", details.seekTime)
+        if (details.seekTime !== null && !isNaN(details.seekTime)) {
+          this.audio.currentTime = details.seekTime
+        }
+      },
+    }
+
+    // Устанавливаем обработчики
+    for (const [action, handler] of Object.entries(handlers)) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler)
+      } catch (error) {
+        console.log(`Действие ${action} не поддерживается`)
+      }
+    }
+  }
+
+  // Периодическое обновление позиции для Media Session
+  startPositionUpdates() {
+    this.stopPositionUpdates() // Останавливаем предыдущий интервал если есть
+
+    this.positionUpdateInterval = setInterval(() => {
+      if (this.isPlaying && this.mediaSessionSupported && this.audio.duration) {
+        this.sendMessageToServiceWorker({
+          type: "PLAYBACK_STATE_CHANGED",
+          data: {
+            isPlaying: this.isPlaying,
+            position: this.audio.currentTime,
+            duration: this.audio.duration,
+            playbackRate: this.audio.playbackRate || 1.0,
+          },
+        })
+      }
+    }, 1000) // Обновляем каждую секунду
+  }
+
+  stopPositionUpdates() {
+    if (this.positionUpdateInterval) {
+      clearInterval(this.positionUpdateInterval)
+      this.positionUpdateInterval = null
+    }
+  }
+
+  // Обработка событий жизненного цикла для мобильных устройств
+  handlePageUnload() {
+    console.log("Page unload")
+    this.stopPositionUpdates()
+    this.releaseAudioWakeLock()
+  }
+
+  handlePageHide() {
+    console.log("Page hide")
+    if (this.isPlaying) {
+      this.enterBackgroundMode()
+    }
+  }
+
+  handlePageShow() {
+    console.log("Page show")
+    if (this.isBackground) {
+      this.exitBackgroundMode()
+    }
+  }
+
+  handleAudioSuspend() {
+    console.log("Audio suspended")
+    // Попытка возобновить воспроизведение на iOS
+    if (this.isPlaying) {
       setTimeout(() => {
-        this.hideBackgroundNotification()
-      }, 5000)
+        this.audio.play().catch((error) => {
+          console.log("Не удалось возобновить воспроизведение:", error)
+        })
+      }, 100)
     }
   }
 
-  // Скрытие уведомления
-  hideBackgroundNotification() {
-    if (this.backgroundNotification) {
-      this.backgroundNotification.classList.remove("show")
+  handleAudioReady() {
+    console.log("Audio ready")
+    this.updateMediaSessionFull()
+  }
+
+  // Регистрация фоновой синхронизации
+  async registerBackgroundSync() {
+    if ("serviceWorker" in navigator && "sync" in window.ServiceWorkerRegistration.prototype) {
+      try {
+        const registration = await navigator.serviceWorker.ready
+        await registration.sync.register("background-playback")
+        console.log("Фоновая синхронизация зарегистрирована")
+      } catch (error) {
+        console.log("Фоновая синхронизация не поддерживается:", error)
+      }
     }
   }
 
-  // Создание мини-плеера
-  createMiniPlayer() {
-    if (this.miniPlayer) return
+  // Переопределяем методы play и pause с улучшенной поддержкой
+  async play() {
+    const tracks = this.getCurrentTrackList()
+    if (tracks.length === 0) return
 
-    this.miniPlayer = document.createElement("div")
-    this.miniPlayer.className = "mini-player show"
-
-    const currentTrack = this.getCurrentTrackList()[this.currentTrackIndex]
+    const currentTrack = tracks[this.currentTrackIndex]
     if (!currentTrack) return
 
-    this.miniPlayer.innerHTML = `
-      <div class="track-cover">
-        ${currentTrack.cover ? `<img src="${currentTrack.cover}" alt="Cover">` : '<i class="fas fa-music"></i>'}
-      </div>
-      <div class="track-info">
-        <div class="track-title">${currentTrack.title}</div>
-        <div class="track-artist">${currentTrack.artist}</div>
-      </div>
-      <div class="mini-controls">
-        <button class="control-btn mini-prev-btn">
-          <i class="fas fa-step-backward"></i>
-        </button>
-        <button class="control-btn play-btn mini-play-btn">
-          <i class="fas ${this.isPlaying ? "fa-pause" : "fa-play"}"></i>
-        </button>
-        <button class="control-btn mini-next-btn">
-          <i class="fas fa-step-forward"></i>
-        </button>
-        <button class="control-btn mini-close-btn">
-          <i class="fas fa-times"></i>
-        </button>
-      </div>
-    `
+    if (!currentTrack.url) {
+      currentTrack.url = await this.getFileFromIndexedDB(currentTrack.audioId, "audioFiles")
+    }
 
-    // События для мини-плеера
-    this.miniPlayer.querySelector(".mini-prev-btn").addEventListener("click", () => this.previousTrack())
-    this.miniPlayer.querySelector(".mini-play-btn").addEventListener("click", () => this.togglePlay())
-    this.miniPlayer.querySelector(".mini-next-btn").addEventListener("click", () => this.nextTrack())
-    this.miniPlayer.querySelector(".mini-close-btn").addEventListener("click", () => this.exitBackgroundMode())
+    if (this.audio.src !== currentTrack.url) {
+      this.audio.src = currentTrack.url
+    }
 
-    document.body.appendChild(this.miniPlayer)
-  }
+    this.setupAudioContext()
 
-  // Удаление мини-плеера
-  removeMiniPlayer() {
-    if (this.miniPlayer) {
-      this.miniPlayer.remove()
-      this.miniPlayer = null
+    try {
+      await this.audio.play()
+      this.isPlaying = true
+      this.playBtn.innerHTML = '<i class="fas fa-pause"></i>'
+
+      // Запрашиваем Wake Lock при начале воспроизведения
+      await this.requestAudioWakeLock()
+
+      // Обновляем Media Session
+      this.updateMediaSessionFull()
+
+      // Обновляем интерфейс
+      this.updateCurrentTrackInfo()
+      this.updateTrackList()
+
+      // Запускаем обновления позиции
+      this.startPositionUpdates()
+
+      // Если в фоновом режиме, обновляем мини-плеер
+      if (this.isBackground) {
+        this.updateMiniPlayer()
+        this.showTrackNotification(currentTrack)
+      }
+    } catch (error) {
+      console.error("Ошибка воспроизведения:", error)
+      // На мобильных устройствах может потребоваться взаимодействие пользователя
+      if (error.name === "NotAllowedError") {
+        alert("Для воспроизведения музыки требуется взаимодействие с экраном")
+      }
     }
   }
 
-  // Обновление мини-плеера
-  updateMiniPlayer() {
-    if (!this.miniPlayer) return
+  pause() {
+    this.audio.pause()
+    this.isPlaying = false
+    this.playBtn.innerHTML = '<i class="fas fa-play"></i>'
 
-    const currentTrack = this.getCurrentTrackList()[this.currentTrackIndex]
-    if (!currentTrack) return
+    // Останавливаем обновления позиции
+    this.stopPositionUpdates()
 
-    const coverElement = this.miniPlayer.querySelector(".track-cover")
-    const titleElement = this.miniPlayer.querySelector(".track-title")
-    const artistElement = this.miniPlayer.querySelector(".track-artist")
-    const playButton = this.miniPlayer.querySelector(".mini-play-btn")
+    // Освобождаем Wake Lock при паузе
+    this.releaseAudioWakeLock()
 
-    if (currentTrack.cover) {
-      coverElement.innerHTML = `<img src="${currentTrack.cover}" alt="Cover">`
-    } else {
-      coverElement.innerHTML = '<i class="fas fa-music"></i>'
+    // Обновляем Media Session
+    if (this.mediaSessionSupported) {
+      navigator.mediaSession.playbackState = "paused"
     }
 
-    titleElement.textContent = currentTrack.title
-    artistElement.textContent = currentTrack.artist
-    playButton.innerHTML = `<i class="fas ${this.isPlaying ? "fa-pause" : "fa-play"}"></i>`
-  }
-
-  // Обновление Media Session
-  updateMediaSession() {
-    const currentTrack = this.getCurrentTrackList()[this.currentTrackIndex]
-    if (!currentTrack) return
-
-    const trackData = {
-      title: currentTrack.title,
-      artist: currentTrack.artist,
-      album: "Мой плейлист",
-      artwork: currentTrack.cover,
-    }
-
-    this.sendMessageToServiceWorker({
-      type: "TRACK_CHANGED",
-      data: trackData,
-    })
-  }
-
-  // Отправка сообщения Service Worker
-  sendMessageToServiceWorker(message) {
-    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage(message)
+    // Обновляем мини-плеер если в фоновом режиме
+    if (this.isBackground) {
+      this.updateMiniPlayer()
     }
   }
 
   // Обработка сообщений от Service Worker
   handleServiceWorkerMessage(event) {
     const { type, data } = event.data
+    console.log("Получено сообщение от SW:", type, data)
 
     switch (type) {
       case "PLAY":
@@ -1340,6 +1539,10 @@ class MusicPlayer {
         break
       case "PAUSE":
         if (this.isPlaying) this.pause()
+        break
+      case "STOP":
+        this.pause()
+        this.audio.currentTime = 0
         break
       case "PREVIOUS":
         this.previousTrack()
@@ -1352,6 +1555,12 @@ class MusicPlayer {
         break
       case "SEEK_TO":
         this.audio.currentTime = data.time
+        break
+      case "MAINTAIN_PLAYBACK":
+        // Поддержание воспроизведения в фоне
+        if (this.isPlaying && this.audio.paused) {
+          this.audio.play().catch(console.error)
+        }
         break
     }
   }
